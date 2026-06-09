@@ -43,6 +43,7 @@ public actor FolderWatcher {
 /// continuation (already `Sendable`) from the callback.
 fileprivate final class WatcherBridge: @unchecked Sendable {
     let path: URL
+    let watchedRoot: String  // canonicalized (symlinks resolved) — matches what FSEvents emits
     private let continuation: AsyncStream<URL>.Continuation
     private let lock = NSLock()
     private var streamRef: FSEventStreamRef?
@@ -53,7 +54,19 @@ fileprivate final class WatcherBridge: @unchecked Sendable {
 
     init(path: URL, continuation: AsyncStream<URL>.Continuation) {
         self.path = path
+        self.watchedRoot = Self.canonicalize(path.path)
         self.continuation = continuation
+    }
+
+    /// Resolve symlinks + standardize so the watched root matches the form FSEvents emits.
+    /// `NSTemporaryDirectory()` is `/var/folders/...` (a symlink to `/private/var/folders/...`);
+    /// FSEvents typically reports the resolved form, so without this the parent-path filter
+    /// drops every event and the watcher looks broken.
+    static func canonicalize(_ p: String) -> String {
+        let url = URL(fileURLWithPath: p).resolvingSymlinksInPath().standardizedFileURL
+        var out = url.path
+        if out.hasSuffix("/") { out.removeLast() }
+        return out
     }
 
     func start() throws {
@@ -86,21 +99,33 @@ fileprivate final class WatcherBridge: @unchecked Sendable {
             let flagsBuf = UnsafeBufferPointer(start: flagsRaw, count: count)
 
             var urls: [URL] = []
+            let rootWithSlash = bridge.watchedRoot + "/"
             for i in 0..<count {
                 guard i < pathsArray.count else { continue }
                 let path = pathsArray[i]
                 let flags = flagsBuf[i]
 
-                let isFile  = (flags & UInt32(kFSEventStreamEventFlagItemIsFile))  != 0
-                let created = (flags & UInt32(kFSEventStreamEventFlagItemCreated)) != 0
-                let renamed = (flags & UInt32(kFSEventStreamEventFlagItemRenamed)) != 0
-                let modified = (flags & UInt32(kFSEventStreamEventFlagItemModified)) != 0
+                let isFile   = (flags & UInt32(kFSEventStreamEventFlagItemIsFile))    != 0
+                let isDir    = (flags & UInt32(kFSEventStreamEventFlagItemIsDir))     != 0
+                let created  = (flags & UInt32(kFSEventStreamEventFlagItemCreated))   != 0
+                let renamed  = (flags & UInt32(kFSEventStreamEventFlagItemRenamed))   != 0
+                let modified = (flags & UInt32(kFSEventStreamEventFlagItemModified))  != 0
 
-                // We care about files that newly appeared. Some screenshot flows arrive as
-                // "renamed" (atomic move from a tmp name) so we include that too.
-                guard isFile && (created || renamed || modified) else { continue }
+                // Canonicalize the event path so we can compare against the canonical watched root.
+                // FSEvents resolves symlinks (especially relevant for tmp dirs in tests).
+                let canon = WatcherBridge.canonicalize(path)
 
-                // The file may have already been moved away — only emit if it's there now.
+                // FSEvents on a directory stream is recursive. We only care about TOP-LEVEL
+                // changes — otherwise we'd see files being moved into our own destination
+                // subfolders and try to re-sort them. Filter by parent path == watched root.
+                guard canon.hasPrefix(rootWithSlash) else { continue }
+                let rest = canon.dropFirst(rootWithSlash.count)
+                guard !rest.contains("/") else { continue }
+
+                // Files OR top-level folders we care about. (Folders are sortable too in v1.5.)
+                guard (isFile || isDir) && (created || renamed || modified) else { continue }
+
+                // The item may have been moved away — only emit if it's there now.
                 guard FileManager.default.fileExists(atPath: path) else { continue }
 
                 urls.append(URL(fileURLWithPath: path))

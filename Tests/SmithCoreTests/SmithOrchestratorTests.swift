@@ -153,6 +153,69 @@ struct MockClassifier: FolderClassifier {
         #expect((await orch.recentMoves()).count == 0)
     }
 
+    @Test func assimilate_lowConfidenceUsesFallbackFolder() async throws {
+        let source = tmpRoot.appendingPathComponent("Desktop3", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("Organized3", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Other"), withIntermediateDirectories: true)
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledger3.jsonl"),
+            autoFileThreshold: 0.85,
+            fallbackFolder: "Other"
+        )
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts", confidence: 0.3),
+            triage: makeFastTriage()
+        )
+
+        let file = source.appendingPathComponent("uncertain.png")
+        try Data("?".utf8).write(to: file)
+        await orch.assimilate(file)
+
+        #expect(!fm.fileExists(atPath: file.path))
+        #expect(fm.fileExists(atPath: organized.appendingPathComponent("Other/uncertain.png").path))
+        #expect((await orch.currentReviewQueue()).isEmpty)
+
+        let recent = await orch.recentMoves()
+        #expect(recent.first?.decision.folder == "Other")
+    }
+
+    @Test func assimilate_movesAFolder() async throws {
+        let source = tmpRoot.appendingPathComponent("Desktop4", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("Organized4", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Work"), withIntermediateDirectories: true)
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledger4.jsonl"),
+            autoFileThreshold: 0.5
+        )
+        // Permissive triage (default config) so the folder isn't rejected by allowedExtensions.
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Work", confidence: 0.9),
+            triage: Triage()
+        )
+
+        let folder = source.appendingPathComponent("ProjectFolder", isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("inside".utf8).write(to: folder.appendingPathComponent("inner.txt"))
+
+        await orch.assimilate(folder)
+
+        #expect(!fm.fileExists(atPath: folder.path))
+        let moved = organized.appendingPathComponent("Work/ProjectFolder")
+        var isDir: ObjCBool = false
+        #expect(fm.fileExists(atPath: moved.path, isDirectory: &isDir))
+        #expect(isDir.boolValue)
+        #expect(fm.fileExists(atPath: moved.appendingPathComponent("inner.txt").path))
+    }
+
     @Test func assimilate_skipsWhenNoCandidateFolders() async throws {
         let source = tmpRoot.appendingPathComponent("Desktop2", isDirectory: true)
         let organized = tmpRoot.appendingPathComponent("Empty", isDirectory: true)

@@ -2,6 +2,105 @@
 
 Running log of decisions and parked ideas. Newest first.
 
+## 2026-06-09 — Always-on via LaunchAgent
+
+User wanted Agent Smith to run with zero ongoing effort. Added two helper scripts:
+
+- `scripts/install-launchd.sh` — builds the release binary, writes
+  `~/Library/LaunchAgents/com.agentsmith.app.plist`, kills any
+  `swift run` or stray instances, and `launchctl bootstrap`s the new agent
+  (`gui/$UID` domain). Idempotent — re-run after code changes to rebuild and
+  swap. Logs go to `~/Library/Logs/AgentSmith/{stdout,stderr}.log`.
+- `scripts/uninstall-launchd.sh` — `launchctl bootout` + remove the plist.
+
+The agent has `RunAtLoad = true` and `KeepAlive = true`, so it boots at
+login and restarts if it ever crashes.
+
+### Layout changes coupled to this
+
+The 4 category folders moved from `~/Pictures/Screenshots/` to `~/Desktop/`.
+`SmithConfig.userDesktopDefault` now has `sourceFolder == organizedRoot ==
+~/Desktop`, plus two safety nets to prevent the watcher from looping:
+
+1. `FolderWatcher` now filters FSEvents to TOP-LEVEL changes only (the C
+   callback compares the event's parent path against the canonicalized watch
+   root). Without this, the watcher would see files moving into its own
+   destination subfolders and try to re-sort them. Canonicalization (resolve
+   symlinks + standardize) is required because FSEvents emits the
+   `/private/var/...` form for paths under `/var/...` (a symlink).
+2. `SmithOrchestrator.assimilate(_:)` now skips items whose lastPathComponent
+   is one of the candidate folder names — the categories never get filed
+   into themselves.
+
+The watcher also now emits directory events (previously file-only) so
+folders dropped on Desktop become sortable.
+
+### TCC implications
+
+The LaunchAgent-started binary is a separate process from Terminal, so macOS
+prompts for Desktop access independently on first launch. User clicks Allow
+once; subsequent launches reuse the grant. If they ever delete the agent's
+TCC entry in System Settings → Privacy → Files and Folders, they'll be
+prompted again.
+
+## 2026-06-09 — Drop review queue, broaden file types
+
+Two deliberate departures from v1 scope (CLAUDE.md §2.3 and §3), at user's request:
+
+**Auto-move everything — no review queue.** `SmithConfig.fallbackFolder` added. When set, any
+classifier decision below `autoFileThreshold` is rewritten to use the fallback folder
+(provided it exists under `organizedRoot`) instead of routing to the review queue.
+`userDesktopDefault` ships with `fallbackFolder = "Other"`, so the review queue is
+effectively unused in the production config. Prime Directive 3 (no silent guessing) is
+formally violated — Smith now guesses, but every move is still reversible via undo. The
+review queue UI + orchestrator code path is left intact for configs where `fallbackFolder`
+is nil (so old behavior is one config flip away).
+
+**All file types and folders.** `Triage.Config` inverted from whitelist → blacklist:
+
+- `allowedExtensions` now defaults to empty (= accept everything).
+- `excludedExtensions` lists macOS bundle types (`.app`, `.bundle`, `.framework`, `.kext`,
+  `.plugin`, `.saver`, `.appex`) plus iCloud placeholders and editor lock files.
+- `excludedFilenames` covers `.DS_Store` and `.localized`.
+- `processFolders = true` by default — directories are moved as opaque blobs.
+- `pdfExtensions = ["pdf"]` triggers PDFKit text extraction via the new
+  `PDFTextExtractor` (best-effort, returns empty string on parse failure so the file
+  still goes through filename-only classification).
+
+`Triage.waitForStability(_:)` short-circuits for directories (no byte-size signal exists
+for a folder; we treat a visible folder as done). `Triage.buildSignals(_:)` routes content
+extraction by extension: Vision for images, PDFKit for PDFs, filename-only for everything
+else (zips, docs, code, folders, …).
+
+**Risk note** — first catch-up sweep against a populated `~/Desktop` will move basically
+everything not on the blacklist. Mostly into `Other/` because filenames rarely
+token-match. The user was warned; mitigation is the existing undo.
+
+## 2026-06-09 — Switched watch path to real ~/Desktop
+
+User wants the natural Cmd-Shift-3 → Desktop flow, no macOS preference changes. So:
+
+- `SmithConfig.userDesktopDefault()` now watches `~/Desktop` and files into
+  `~/Pictures/Screenshots/<folder>` (deliberately different trees so cleaned files don't
+  accumulate sub-folders on the Desktop).
+- macOS screenshot default location was reverted (`defaults delete com.apple.screencapture
+  location`) so the preference matches user expectation.
+- Catch-up sweep added to `SmithOrchestrator.start()` so a snapshot of the source folder is
+  processed at launch before live FSEvents come in (covers the case "I launched the app and
+  there are 30 screenshots already sitting on my Desktop"). Test in
+  `Tests/SmithCoreTests/StartupSweepTests.swift`.
+
+### Prime Directive 5 deviation, recorded
+
+CLAUDE.md §2.5 says "Never touch the user's real folders during development." The user
+explicitly overrode this — they want production behavior now. On first launch after this
+change, macOS will TCC-prompt the parent process (Terminal under `swift run`) for Desktop
+read access. Until granted, `FolderWatcher.start()` will throw `watcherFailedToStart`.
+
+This means the on-Tahoe / M5 release path is more aligned now: the same `userDesktopDefault`
+config will be the production one, just running from a notarized `.app` with the right
+entitlements instead of from a `swift run` against Terminal's TCC scope.
+
 ## 2026-06-08 — Initial build (M0–M4 in one sweep)
 
 All non-deferred milestones (M0 scaffold, M1 watcher, M2 filer+ledger+undo, M3 triage+classifier,

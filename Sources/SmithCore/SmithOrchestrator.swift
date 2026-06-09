@@ -60,6 +60,16 @@ public actor SmithOrchestrator {
 
     public func start() async throws {
         try await ensureDirectoriesExist()
+
+        // Snapshot anything already in the source folder BEFORE the watcher starts so the
+        // catch-up scan and the live watcher don't overlap. FSEvents `sinceNow` won't refire
+        // for pre-existing files, so the watcher will only see things created after this point.
+        let preExisting = (try? FileManager.default.contentsOfDirectory(
+            at: config.sourceFolder,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
         try await watcher.start()
         let stream = watcher.events
         watchTask = Task { [weak self] in
@@ -67,7 +77,16 @@ public actor SmithOrchestrator {
                 await self?.assimilate(url)
             }
         }
-        AppLog.smith.info("Smith orchestrator started")
+
+        AppLog.smith.info("Smith orchestrator started; \(preExisting.count) pre-existing file(s) to sweep")
+
+        // Run the catch-up sweep in the background so start() returns promptly.
+        Task { [weak self] in
+            guard let self else { return }
+            for url in preExisting {
+                await self.assimilate(url)
+            }
+        }
     }
 
     public func stop() async {
@@ -104,6 +123,13 @@ public actor SmithOrchestrator {
             return
         }
 
+        // The candidate folders themselves are destinations, not sources — never move them.
+        // (Relevant when source == organizedRoot, e.g. categories live on Desktop alongside their inputs.)
+        if folders.contains(url.lastPathComponent) {
+            emit(.skipped(url, reason: "destination folder — left alone"))
+            return
+        }
+
         let signals: FileSignals
         let decision: FolderDecision
         do {
@@ -114,8 +140,18 @@ public actor SmithOrchestrator {
             return
         }
 
-        // Threshold gate (Prime Directive 3 — no silent guessing).
-        guard decision.confidence >= config.autoFileThreshold else {
+        // Threshold gate. If below threshold and a fallback folder exists, use it; otherwise
+        // route to the review queue (the original Prime Directive 3 behavior).
+        let effectiveDecision: FolderDecision
+        if decision.confidence >= config.autoFileThreshold {
+            effectiveDecision = decision
+        } else if let fallback = config.fallbackFolder, folders.contains(fallback) {
+            effectiveDecision = FolderDecision(
+                folder: fallback,
+                confidence: decision.confidence,
+                reason: "below threshold (\(String(format: "%.2f", decision.confidence))) — sent to fallback: \(decision.reason)"
+            )
+        } else {
             let item = ReviewItem(url: url, signals: signals, suggestion: decision)
             reviewQueue.append(item)
             emit(.queued(item))
@@ -123,9 +159,9 @@ public actor SmithOrchestrator {
         }
 
         // Auto-file.
-        let destDir = config.organizedRoot.appendingPathComponent(decision.folder, isDirectory: true)
+        let destDir = config.organizedRoot.appendingPathComponent(effectiveDecision.folder, isDirectory: true)
         do {
-            let move = try filer.move(url, intoDirectory: destDir, decision: decision)
+            let move = try filer.move(url, intoDirectory: destDir, decision: effectiveDecision)
             try await ledger.append(move)
             emit(.filed(move))
         } catch {

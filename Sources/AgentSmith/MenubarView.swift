@@ -20,11 +20,6 @@ struct MenubarView: View {
             footer
         }
         .padding(12)
-        .onAppear {
-            if state.runState == .stopped {
-                state.start()
-            }
-        }
     }
 
     private var header: some View {

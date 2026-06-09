@@ -8,6 +8,9 @@ DerivedData/
 xcuserdata/
 
 # Sandbox is a runtime playground — only keep its shape, not its contents
+Sandbox/*
+!Sandbox/Desktop/
+!Sandbox/Organized/
 Sandbox/Desktop/*
 !Sandbox/Desktop/.gitkeep
 Sandbox/Organized/*

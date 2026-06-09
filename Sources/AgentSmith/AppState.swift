@@ -5,8 +5,14 @@ import Models
 
 /// `ObservableObject` shim around the actor-backed `SmithOrchestrator`. Views observe this
 /// for state changes; user actions flow back through `Task`s into the orchestrator.
+///
+/// Singleton so the orchestrator can be started by `AppDelegate.applicationDidFinishLaunching`
+/// (i.e. at launch) rather than waiting for the user's first menubar click. SwiftUI views
+/// pull the same instance via `.environmentObject(AppState.shared)`.
 @MainActor
 final class AppState: ObservableObject {
+    static let shared = AppState()
+
     enum RunState: Equatable {
         case stopped
         case starting
@@ -23,8 +29,8 @@ final class AppState: ObservableObject {
     private var orchestrator: SmithOrchestrator?
     private var eventsTask: Task<Void, Never>?
 
-    init() {
-        self.config = SmithConfig.sandboxDefault()
+    private init() {
+        self.config = SmithConfig.userDesktopDefault()
     }
 
     func start() {

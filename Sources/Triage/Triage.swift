@@ -1,31 +1,78 @@
 import Foundation
 import Models
 
-/// Triage decides whether a freshly-noticed file is something Smith should handle, and
-/// waits until the file is fully written before passing it downstream.
+/// Triage decides whether a freshly-noticed item is something Smith should handle, waits
+/// until it's done being written, and builds the `FileSignals` payload for the Classifier.
 ///
-/// v1 only handles screenshots (macOS screenshot filename pattern OR any `.png`/`.jpg`/`.jpeg`
-/// the user drops into the watched folder).
+/// Default policy is "process everything except known-bad" (a blacklist): app bundles,
+/// frameworks, iCloud placeholders, browser partial-downloads, OS metadata files, dotfiles.
+/// Whitelist mode is available by setting `allowedExtensions`.
 public struct Triage: Sendable {
     public struct Config: Sendable {
-        /// Extensions Triage will consider. Lowercase, no leading dot.
+        /// If non-empty, only files with these extensions are processed.
+        /// If empty (default), all extensions are processed subject to `excludedExtensions`.
         public var allowedExtensions: Set<String>
-        /// Filename suffixes that mean "still being written, ignore." Lowercase.
+        /// Extensions Smith always skips. Catches macOS bundle types (`.app`, `.bundle`, …)
+        /// plus a few junk file conventions.
+        public var excludedExtensions: Set<String>
+        /// Lowercase filename suffixes meaning "still being written".
         public var partialSuffixes: Set<String>
-        /// How long to wait between size polls.
+        /// Exact filenames Smith never touches (`.DS_Store`, `.localized`).
+        public var excludedFilenames: Set<String>
+        /// Process directories as candidates for moving. Default true.
+        public var processFolders: Bool
+        /// File extensions Vision should OCR.
+        public var ocrExtensions: Set<String>
+        /// File extensions PDFKit should extract text from.
+        public var pdfExtensions: Set<String>
+        /// Files whose presence in a directory marks it as an active project — Smith
+        /// refuses to move folders containing any of these (regardless of `processFolders`).
+        /// Lowercase. Empty set disables project detection.
+        public var projectMarkers: Set<String>
+
         public var pollInterval: Duration
-        /// How many consecutive matching size polls are required before declaring stability.
         public var requiredStablePolls: Int
-        /// Max time to wait for stability before giving up.
         public var stabilityTimeout: Duration
 
-        public static let `default` = Config(
-            allowedExtensions: ["png", "jpg", "jpeg", "heic"],
-            partialSuffixes: [".crdownload", ".download", ".part", ".tmp", ".partial"],
-            pollInterval: .milliseconds(250),
-            requiredStablePolls: 2,
-            stabilityTimeout: .seconds(30)
-        )
+        public init(
+            allowedExtensions: Set<String> = [],
+            excludedExtensions: Set<String> = [
+                "app", "bundle", "framework", "kext", "plugin", "saver",
+                "appex", "icloud", "alias", "lock", "swp",
+                "xcodeproj", "xcworkspace", "playground"
+            ],
+            partialSuffixes: Set<String> = [
+                ".crdownload", ".download", ".part", ".tmp", ".partial"
+            ],
+            excludedFilenames: Set<String> = [".DS_Store", ".localized"],
+            processFolders: Bool = true,
+            ocrExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "gif", "tiff", "bmp", "webp"],
+            pdfExtensions: Set<String> = ["pdf"],
+            projectMarkers: Set<String> = [
+                ".git", "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                "package.swift", "cargo.toml", "go.mod", "pyproject.toml", "pipfile",
+                "requirements.txt", "gemfile", "pom.xml", "build.gradle", "build.gradle.kts",
+                "pubspec.yaml", "composer.json", "makefile", "cmakelists.txt",
+                ".xcodeproj", ".xcworkspace", "node_modules"
+            ],
+            pollInterval: Duration = .milliseconds(250),
+            requiredStablePolls: Int = 2,
+            stabilityTimeout: Duration = .seconds(30)
+        ) {
+            self.allowedExtensions = allowedExtensions
+            self.excludedExtensions = excludedExtensions
+            self.partialSuffixes = partialSuffixes
+            self.excludedFilenames = excludedFilenames
+            self.processFolders = processFolders
+            self.ocrExtensions = ocrExtensions
+            self.pdfExtensions = pdfExtensions
+            self.projectMarkers = projectMarkers
+            self.pollInterval = pollInterval
+            self.requiredStablePolls = requiredStablePolls
+            self.stabilityTimeout = stabilityTimeout
+        }
+
+        public static let `default` = Config()
     }
 
     public let config: Config
@@ -35,38 +82,89 @@ public struct Triage: Sendable {
     }
 
     /// Fast filter — does this URL look like something we should touch at all?
-    /// Pure / synchronous so callers can short-circuit before the more expensive stability wait.
     public func shouldConsider(_ url: URL) -> Bool {
         let name = url.lastPathComponent
         let lower = name.lowercased()
 
-        // Skip dotfiles and OS metadata.
+        // Skip dotfiles.
         if name.hasPrefix(".") { return false }
+
+        // Skip exact-name exclusions.
+        if config.excludedFilenames.contains(name) { return false }
 
         // Skip browser/download partial-file conventions.
         for suffix in config.partialSuffixes where lower.hasSuffix(suffix) {
             return false
         }
 
-        // Must be in our allowed extension set.
+        // Skip excluded extensions — catches `.app`, `.bundle`, `.framework`, etc.
+        // (macOS treats those as files with a directory layout; the extension is the tell.)
         let ext = url.pathExtension.lowercased()
-        guard config.allowedExtensions.contains(ext) else { return false }
+        if !ext.isEmpty && config.excludedExtensions.contains(ext) { return false }
+
+        // Project safety: if this is a directory containing well-known project markers
+        // (.git, package.json, etc.), refuse — never move an active project.
+        if !config.projectMarkers.isEmpty && looksLikeActiveProject(url) {
+            return false
+        }
+
+        // Skip macOS Finder aliases. These have no special extension; we detect them by
+        // the file-system attribute `isAliasFile`.
+        if isAliasFile(url) { return false }
+
+        // Whitelist mode: must match if the whitelist is set.
+        if !config.allowedExtensions.isEmpty {
+            if ext.isEmpty {
+                // Extension-less entries (folders, README-style files) are governed by processFolders.
+                return config.processFolders
+            }
+            return config.allowedExtensions.contains(ext)
+        }
 
         return true
     }
 
-    /// True iff the filename looks like a macOS screenshot (Screenshot 2026-06-08 at 10.13.42 AM.png).
-    /// Used to flag automatically-generated screenshots vs files the user dragged in (which we also handle).
+    /// True iff `url` is a directory whose immediate children include any of the
+    /// configured project markers (`.git`, `package.json`, etc.).
+    public func looksLikeActiveProject(_ url: URL) -> Bool {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            return false
+        }
+        guard let entries = try? fm.contentsOfDirectory(atPath: url.path) else {
+            return false
+        }
+        let lowered = Set(entries.map { $0.lowercased() })
+        return !lowered.isDisjoint(with: config.projectMarkers)
+    }
+
+    /// True iff the URL is a Finder alias (resolves to a different file/folder).
+    public func isAliasFile(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.isAliasFileKey, .isSymbolicLinkKey])
+        return (values?.isAliasFile ?? false) || (values?.isSymbolicLink ?? false)
+    }
+
+    /// True iff the filename looks like a macOS screenshot. Informational; not used as a filter.
     public func looksLikeMacScreenshot(_ url: URL) -> Bool {
         let name = url.lastPathComponent
         return name.range(of: #"^Screenshot \d{4}-\d{2}-\d{2}( at .+)?\.(png|jpe?g|heic)$"#,
                           options: [.regularExpression, .caseInsensitive]) != nil
     }
 
-    /// Block until the file's byte size stays constant across `requiredStablePolls` polls,
-    /// or until `stabilityTimeout` elapses. Throws `fileNotStable` on timeout.
+    /// Block until the file's byte size is stable across `requiredStablePolls` polls, or throw on timeout.
+    /// Directories return immediately — they don't have a meaningful byte-size signal.
     public func waitForStability(_ url: URL) async throws {
         let fm = FileManager.default
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            throw SmithError.fileNotFound(url)
+        }
+        if isDir.boolValue {
+            return  // a directory visible in the watched folder is treated as done
+        }
+
         let deadline = ContinuousClock.now.advanced(by: config.stabilityTimeout)
 
         var lastSize: Int64? = nil
@@ -74,7 +172,6 @@ public struct Triage: Sendable {
 
         while ContinuousClock.now < deadline {
             guard fm.fileExists(atPath: url.path) else {
-                // File disappeared — it was moved or deleted before we could act.
                 throw SmithError.fileNotFound(url)
             }
             let size = (try? fileByteSize(url)) ?? 0
@@ -98,39 +195,48 @@ public struct Triage: Sendable {
         throw SmithError.fileNotStable(url)
     }
 
-    /// Build the `FileSignals` payload Triage passes to the Classifier. Reads file size,
-    /// runs OCR + image labels via Vision, attaches the candidate folder list.
+    /// Build the `FileSignals` payload Triage passes to the Classifier. Different content
+    /// extractors per type: Vision OCR for images, PDFKit for PDFs, filename-only otherwise.
     public func buildSignals(
         for url: URL,
         candidateFolders: [String]
     ) async throws -> FileSignals {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else { throw SmithError.fileNotFound(url) }
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            throw SmithError.fileNotFound(url)
+        }
 
-        let size = (try? fileByteSize(url)) ?? 0
+        let size: Int64 = isDir.boolValue ? 0 : ((try? fileByteSize(url)) ?? 0)
+        let ext = url.pathExtension.lowercased()
 
-        // Vision is best-effort. If OCR fails (corrupt image, unsupported format) we still
-        // hand the classifier the filename + folder list — it'll fall back to filename signal.
-        var ocrText = ""
+        var extractedText = ""
         var labels: [String] = []
-        if let result = try? await VisionOCR.extract(from: url) {
-            ocrText = result.text
-            labels = result.labels
+
+        if !isDir.boolValue {
+            if config.ocrExtensions.contains(ext) {
+                if let r = try? await VisionOCR.extract(from: url) {
+                    extractedText = r.text
+                    labels = r.labels
+                }
+            } else if config.pdfExtensions.contains(ext) {
+                extractedText = PDFTextExtractor.extract(from: url)
+            }
+            // else: filename-only classification
         }
 
         return FileSignals(
             url: url,
             filename: url.lastPathComponent,
             byteSize: size,
-            ocrText: ocrText,
+            ocrText: extractedText,
             imageLabels: labels,
             candidateFolders: candidateFolders
         )
     }
 
     private func fileByteSize(_ url: URL) throws -> Int64 {
-        // Don't use URL.resourceValues here — values are cached on the URL instance, so a
-        // long-running stability poll would observe the size at first call forever.
+        // Don't use URL.resourceValues here — it caches on the URL instance.
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         return (attrs[.size] as? NSNumber)?.int64Value ?? 0
     }

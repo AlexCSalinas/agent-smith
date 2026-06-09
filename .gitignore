@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+Package.resolved
+DerivedData/
+xcuserdata/
+
+# Sandbox is a runtime playground — only keep its shape, not its contents
+Sandbox/Desktop/*
+!Sandbox/Desktop/.gitkeep
+Sandbox/Organized/*
+!Sandbox/Organized/.gitkeep

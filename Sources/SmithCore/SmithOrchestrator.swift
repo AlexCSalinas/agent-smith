@@ -1,0 +1,188 @@
+import Foundation
+import Models
+import Watcher
+import Triage
+import Filer
+import Ledger
+import Classifier
+
+/// Wires the modules together: Watcher → Triage → Classifier → (Filer + Ledger) or review queue.
+/// One `Smith` is spawned per file via `assimilate(_:)` (the per-file work unit from
+/// CLAUDE.md §10). All Smith I/O flows through this orchestrator.
+public actor SmithOrchestrator {
+    public struct Event: Sendable, Equatable {
+        public enum Kind: Sendable, Equatable {
+            case filed(Move)
+            case queued(ReviewItem)
+            case skipped(URL, reason: String)
+            case error(URL, message: String)
+            case undone(Move)
+        }
+        public let timestamp: Date
+        public let kind: Kind
+
+        public init(timestamp: Date = Date(), kind: Kind) {
+            self.timestamp = timestamp
+            self.kind = kind
+        }
+    }
+
+    private var config: SmithConfig
+    private let watcher: FolderWatcher
+    private let triage: Triage
+    private let classifier: any FolderClassifier
+    private let filer: Filer
+    private let ledger: Ledger
+
+    private var watchTask: Task<Void, Never>?
+    private var reviewQueue: [ReviewItem] = []
+    private let eventsContinuation: AsyncStream<Event>.Continuation
+    public nonisolated let events: AsyncStream<Event>
+
+    public init(
+        config: SmithConfig,
+        classifier: any FolderClassifier = LocalClassifier(),
+        triage: Triage = Triage()
+    ) throws {
+        self.config = config
+        self.watcher = FolderWatcher(path: config.sourceFolder)
+        self.triage = triage
+        self.classifier = classifier
+        self.filer = Filer()
+        self.ledger = try Ledger(at: config.ledgerURL)
+
+        let (stream, continuation) = AsyncStream<Event>.makeStream(bufferingPolicy: .bufferingNewest(200))
+        self.events = stream
+        self.eventsContinuation = continuation
+    }
+
+    // MARK: - Lifecycle
+
+    public func start() async throws {
+        try await ensureDirectoriesExist()
+        try await watcher.start()
+        let stream = watcher.events
+        watchTask = Task { [weak self] in
+            for await url in stream {
+                await self?.assimilate(url)
+            }
+        }
+        AppLog.smith.info("Smith orchestrator started")
+    }
+
+    public func stop() async {
+        watchTask?.cancel()
+        watchTask = nil
+        await watcher.stop()
+        eventsContinuation.finish()
+        AppLog.smith.info("Smith orchestrator stopped")
+    }
+
+    // MARK: - Per-file Smith
+
+    /// The Smith for one file: classify-and-file or route to review.
+    /// Public so tests can drive it directly without spinning up the watcher.
+    public func assimilate(_ url: URL) async {
+        // Fast filter — extension, dotfiles, partial-download suffixes.
+        guard triage.shouldConsider(url) else {
+            emit(.skipped(url, reason: "not a candidate file type"))
+            return
+        }
+
+        // Wait for the file to finish being written.
+        do {
+            try await triage.waitForStability(url)
+        } catch {
+            emit(.error(url, message: "\(error)"))
+            return
+        }
+
+        // Build signals + classify.
+        let folders = config.candidateFolders()
+        if folders.isEmpty {
+            emit(.skipped(url, reason: "no candidate folders under organized root yet"))
+            return
+        }
+
+        let signals: FileSignals
+        let decision: FolderDecision
+        do {
+            signals = try await triage.buildSignals(for: url, candidateFolders: folders)
+            decision = try await classifier.classify(signals)
+        } catch {
+            emit(.error(url, message: "\(error)"))
+            return
+        }
+
+        // Threshold gate (Prime Directive 3 — no silent guessing).
+        guard decision.confidence >= config.autoFileThreshold else {
+            let item = ReviewItem(url: url, signals: signals, suggestion: decision)
+            reviewQueue.append(item)
+            emit(.queued(item))
+            return
+        }
+
+        // Auto-file.
+        let destDir = config.organizedRoot.appendingPathComponent(decision.folder, isDirectory: true)
+        do {
+            let move = try filer.move(url, intoDirectory: destDir, decision: decision)
+            try await ledger.append(move)
+            emit(.filed(move))
+        } catch {
+            emit(.error(url, message: "\(error)"))
+        }
+    }
+
+    // MARK: - Review queue actions
+
+    public func currentReviewQueue() -> [ReviewItem] { reviewQueue }
+
+    /// User-approved review item: move it using the (possibly user-corrected) folder name.
+    public func approveReview(_ id: UUID, intoFolder folder: String) async throws -> Move {
+        guard let idx = reviewQueue.firstIndex(where: { $0.id == id }) else {
+            throw SmithError.undoFailed(reason: "review item \(id) not found")
+        }
+        let item = reviewQueue.remove(at: idx)
+        let decision = FolderDecision(folder: folder, confidence: 1.0, reason: "user-approved")
+        let destDir = config.organizedRoot.appendingPathComponent(folder, isDirectory: true)
+        let move = try filer.move(item.url, intoDirectory: destDir, decision: decision)
+        try await ledger.append(move)
+        emit(.filed(move))
+        return move
+    }
+
+    public func dismissReview(_ id: UUID) {
+        reviewQueue.removeAll { $0.id == id }
+    }
+
+    // MARK: - Undo
+
+    public func undo(_ moveID: UUID) async throws -> Move {
+        guard let move = await ledger.get(moveID), !move.undone else {
+            throw SmithError.undoFailed(reason: "move not found or already undone")
+        }
+        let undone = try filer.undo(move)
+        let recorded = try await ledger.recordUndo(of: moveID)
+        emit(.undone(undone))
+        return recorded
+    }
+
+    // MARK: - Ledger access (for UI)
+
+    public func recentMoves(limit: Int = 30) async -> [Move] {
+        await ledger.recent(limit: limit)
+    }
+
+    // MARK: - Internals
+
+    private func ensureDirectoriesExist() async throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: config.sourceFolder, withIntermediateDirectories: true)
+        try fm.createDirectory(at: config.organizedRoot, withIntermediateDirectories: true)
+        try fm.createDirectory(at: config.ledgerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    }
+
+    private func emit(_ kind: Event.Kind) {
+        eventsContinuation.yield(Event(kind: kind))
+    }
+}

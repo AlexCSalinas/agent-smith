@@ -89,6 +89,12 @@ public actor Ledger {
         order.compactMap { movesByID[$0] }
     }
 
+    /// All moves with the given `batchID`, in insertion order. Used by `undoBatch` to
+    /// reverse a Curator-applied plan in one action.
+    public func moves(inBatch batchID: UUID) -> [Move] {
+        all().filter { $0.batchID == batchID }
+    }
+
     /// Most recent first, capped to `limit`.
     public func recent(limit: Int = 20) -> [Move] {
         Array(all().reversed().prefix(limit))

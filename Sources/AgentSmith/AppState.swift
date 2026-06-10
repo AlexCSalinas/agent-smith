@@ -23,6 +23,7 @@ final class AppState: ObservableObject {
 
     @Published private(set) var runState: RunState = .stopped
     @Published private(set) var recentMoves: [Move] = []
+    @Published private(set) var recentActivity: [ActivityEntry] = []
     @Published private(set) var reviewQueue: [ReviewItem] = []
     @Published private(set) var pendingPlans: [CuratorPlan] = []
     @Published private(set) var lastEvent: String = "Waiting for files…"
@@ -123,6 +124,14 @@ final class AppState: ObservableObject {
         }
     }
 
+    func undoBatch(_ batchID: UUID) {
+        guard let orch = orchestrator else { return }
+        Task {
+            _ = await orch.undoBatch(batchID)
+            await self.refresh()
+        }
+    }
+
     private func subscribeToEvents(_ orch: SmithOrchestrator) {
         let stream = orch.events
         eventsTask = Task { [weak self] in
@@ -157,10 +166,67 @@ final class AppState: ObservableObject {
     private func refresh() async {
         guard let orch = orchestrator else { return }
         let queue = await orch.currentReviewQueue()
-        let recent = await orch.recentMoves(limit: 20)
+        let recent = await orch.recentMoves(limit: 50)
         let plans = await orch.currentPendingPlans()
         self.reviewQueue = queue
         self.recentMoves = recent
         self.pendingPlans = plans
+        self.recentActivity = ActivityEntry.group(recent).prefix(20).map { $0 }
+    }
+}
+
+/// Activity-feed item: either a single live-classifier move, or a Curator batch shown
+/// as one row. Grouping happens client-side from the latest moves snapshot so the
+/// Ledger remains a flat append-only log of `Move`s.
+enum ActivityEntry: Identifiable {
+    case single(Move)
+    case batch(id: UUID, category: String, moves: [Move])
+
+    var id: String {
+        switch self {
+        case .single(let m): return "single:\(m.id.uuidString)"
+        case .batch(let id, _, _): return "batch:\(id.uuidString)"
+        }
+    }
+
+    /// Group a most-recent-first list of moves: contiguous moves with the same
+    /// `batchID` collapse into one batch entry. Non-batch moves stay individual.
+    /// The result is ordered by the first occurrence of each entry in `moves`.
+    static func group(_ moves: [Move]) -> [ActivityEntry] {
+        var entries: [ActivityEntry] = []
+        var batchBuckets: [UUID: [Move]] = [:]
+        var batchOrder: [UUID] = []
+
+        for move in moves {
+            if let batchID = move.batchID {
+                if batchBuckets[batchID] == nil {
+                    batchBuckets[batchID] = []
+                    batchOrder.append(batchID)
+                }
+                batchBuckets[batchID]?.append(move)
+            } else {
+                entries.append(.single(move))
+            }
+        }
+
+        for batchID in batchOrder {
+            let batch = batchBuckets[batchID] ?? []
+            let category = batch.first?.decision.folder
+                .split(separator: "/")
+                .first
+                .map(String.init) ?? "—"
+            entries.append(.batch(id: batchID, category: category, moves: batch))
+        }
+        // Keep newest-first overall, using each entry's first move timestamp.
+        return entries.sorted { lhs, rhs in
+            lhs.timestamp > rhs.timestamp
+        }
+    }
+
+    var timestamp: Date {
+        switch self {
+        case .single(let m): return m.timestamp
+        case .batch(_, _, let moves): return moves.map(\.timestamp).max() ?? .distantPast
+        }
     }
 }

@@ -231,16 +231,75 @@ public actor SmithOrchestrator {
         pendingPlans.removeAll { $0.id == id }
     }
 
-    /// M7 stub: removes the plan from the pending list and returns it. M8 will wire
-    /// this to actually execute the contained moves under a single ledger batchID.
+    /// Apply a pending Curator plan: for each (file, subfolder), move the file from
+    /// `organizedRoot/<category>/<file>` into `organizedRoot/<category>/<subfolder>/`,
+    /// recording every move under a single shared `batchID` so `undoBatch(_:)` can
+    /// reverse the whole thing in one click.
+    ///
+    /// Partial failures don't abort the rest of the plan — every file Smith can move
+    /// is moved; anything that fails is logged and skipped. Completed moves remain in
+    /// the ledger regardless, so the user can still inspect / undo what did happen.
+    /// Returns `(batchID, moves)` describing what landed.
     @discardableResult
-    public func approvePlan(_ id: UUID) async throws -> CuratorPlan {
+    public func approvePlan(_ id: UUID) async throws -> (batchID: UUID, moves: [Move]) {
         guard let idx = pendingPlans.firstIndex(where: { $0.id == id }) else {
             throw SmithError.undoFailed(reason: "pending plan \(id) not found")
         }
         let plan = pendingPlans.remove(at: idx)
-        AppLog.curator.info("approvePlan stub: \(plan.category, privacy: .public) — apply wired in M8")
-        return plan
+        let batchID = UUID()
+        let categoryURL = config.organizedRoot.appendRelative(plan.category)
+        var moves: [Move] = []
+
+        for sub in plan.subfolders {
+            let destDir = categoryURL.appendingPathComponent(sub.name, isDirectory: true)
+            for file in sub.files {
+                let src = categoryURL.appendingPathComponent(file)
+                let decision = FolderDecision(
+                    folder: "\(plan.category)/\(sub.name)",
+                    confidence: 1.0,
+                    reason: "curator-approved: \(sub.rationale)"
+                )
+                do {
+                    let move = try filer.move(src, intoDirectory: destDir, decision: decision, batchID: batchID)
+                    try await ledger.append(move)
+                    moves.append(move)
+                    emit(.filed(move))
+                } catch {
+                    AppLog.curator.error(
+                        "plan apply skipped \(file, privacy: .public) (\(plan.category, privacy: .public)/\(sub.name, privacy: .public)): \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+        }
+
+        AppLog.curator.info(
+            "approved plan \(plan.category, privacy: .public) — \(moves.count, privacy: .public)/\(plan.fileCount, privacy: .public) files moved as batch \(batchID.uuidString, privacy: .public)"
+        )
+        return (batchID, moves)
+    }
+
+    /// Reverse every (un-undone) move in a batch. Reverse order so the moves come out
+    /// in the same order they went in. Each undo failure is logged and skipped — the
+    /// rest still proceed. Newly-created subfolders are intentionally left on disk
+    /// even if they end up empty (Prime Directive 1 — never delete anything the user
+    /// might want).
+    @discardableResult
+    public func undoBatch(_ batchID: UUID) async -> [Move] {
+        let batchMoves = await ledger.moves(inBatch: batchID).filter { !$0.undone }
+        var undone: [Move] = []
+        for move in batchMoves.reversed() {
+            do {
+                let result = try filer.undo(move)
+                let recorded = try await ledger.recordUndo(of: move.id)
+                undone.append(recorded)
+                emit(.undone(result))
+            } catch {
+                AppLog.curator.error(
+                    "undo batch \(batchID.uuidString, privacy: .public) skipped \(move.destinationURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+        return undone
     }
 
     // MARK: - Undo
@@ -259,6 +318,11 @@ public actor SmithOrchestrator {
 
     public func recentMoves(limit: Int = 30) async -> [Move] {
         await ledger.recent(limit: limit)
+    }
+
+    /// Look up all moves with the given `batchID`. Returns latest-state records.
+    public func movesInBatch(_ batchID: UUID) async -> [Move] {
+        await ledger.moves(inBatch: batchID)
     }
 
     // MARK: - Internals

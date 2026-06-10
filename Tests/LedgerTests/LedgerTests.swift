@@ -82,6 +82,56 @@ import Testing
         #expect(recent.last?.sourceURL.lastPathComponent == "f2.png")
     }
 
+    @Test func movesInBatch_returnsOnlyThatBatch() async throws {
+        let ledger = try Ledger(at: ledgerURL)
+        let batchA = UUID()
+        let batchB = UUID()
+        let m1 = Move(
+            sourceURL: URL(fileURLWithPath: "/x/a.png"),
+            destinationURL: URL(fileURLWithPath: "/y/a.png"),
+            decision: FolderDecision(folder: "y", confidence: 1, reason: ""),
+            batchID: batchA
+        )
+        let m2 = Move(
+            sourceURL: URL(fileURLWithPath: "/x/b.png"),
+            destinationURL: URL(fileURLWithPath: "/y/b.png"),
+            decision: FolderDecision(folder: "y", confidence: 1, reason: ""),
+            batchID: batchA
+        )
+        let m3 = Move(
+            sourceURL: URL(fileURLWithPath: "/x/c.png"),
+            destinationURL: URL(fileURLWithPath: "/y/c.png"),
+            decision: FolderDecision(folder: "y", confidence: 1, reason: ""),
+            batchID: batchB
+        )
+        let solo = makeMove("solo.png")
+        try await ledger.append(m1)
+        try await ledger.append(m2)
+        try await ledger.append(m3)
+        try await ledger.append(solo)
+
+        let inA = await ledger.moves(inBatch: batchA)
+        #expect(inA.map(\.id) == [m1.id, m2.id])
+        let inB = await ledger.moves(inBatch: batchB)
+        #expect(inB.map(\.id) == [m3.id])
+    }
+
+    @Test func decode_oldLineWithoutBatchID_succeeds() throws {
+        // Construct a pre-M8 ledger line by hand (no `batchID` key).
+        let id = UUID()
+        let timestamp = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 1_700_000_000))
+        let oldLine = """
+            {"id":"\(id.uuidString)","timestamp":"\(timestamp)","sourceURL":"file:///tmp/a.png","destinationURL":"file:///tmp/dest/a.png","decision":{"folder":"dest","confidence":0.9,"reason":"x"},"undone":false}
+            """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let decoded = try decoder.decode(Move.self, from: Data(oldLine.utf8))
+        #expect(decoded.id == id)
+        #expect(decoded.batchID == nil)
+        #expect(decoded.undone == false)
+    }
+
     @Test func appendOnlyOnDisk_undoAddsLineDoesNotRewriteHistory() async throws {
         let ledger = try Ledger(at: ledgerURL)
         let m = makeMove("y.png")

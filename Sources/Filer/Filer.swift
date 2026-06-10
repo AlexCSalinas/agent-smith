@@ -9,11 +9,14 @@ public struct Filer: Sendable {
     public init() {}
 
     /// Move `source` into `destinationDirectory`, collision-renaming as needed.
-    /// Returns the `Move` record (which the caller hands to the Ledger).
+    /// Returns the `Move` record (which the caller hands to the Ledger). `batchID`,
+    /// when set, groups this move with others in the ledger so they can be undone
+    /// together (M8 — Curator-plan application).
     public func move(
         _ source: URL,
         intoDirectory destinationDirectory: URL,
-        decision: FolderDecision
+        decision: FolderDecision,
+        batchID: UUID? = nil
     ) throws -> Move {
         let fm = FileManager.default
 
@@ -48,7 +51,8 @@ public struct Filer: Sendable {
         return Move(
             sourceURL: source,
             destinationURL: destination,
-            decision: decision
+            decision: decision,
+            batchID: batchID
         )
     }
 

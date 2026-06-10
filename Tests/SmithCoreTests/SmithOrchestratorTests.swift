@@ -358,6 +358,116 @@ struct StubOrchPlanner: TaxonomyPlanner {
         #expect((await orch.currentPendingPlans()).count == 1)
     }
 
+    @Test func approvePlan_movesFilesUnderBatchIDAndUndoBatchRestores() async throws {
+        // Full M8 loop against the sandbox: crowd a category → mocked plan → approve →
+        // files land in subfolders with one shared batchID → batch undo restores everything.
+        let source = tmpRoot.appendingPathComponent("DesktopA", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedA", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let receipts = organized.appendingPathComponent("Receipts", isDirectory: true)
+        try fm.createDirectory(at: receipts, withIntermediateDirectories: true)
+
+        let uberFiles = (0..<6).map { "uber\($0).png" }
+        let amazonFiles = (0..<5).map { "amazon\($0).png" }
+        for name in (uberFiles + amazonFiles) {
+            try Data(name.utf8).write(to: receipts.appendingPathComponent(name))
+        }
+
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerA.jsonl"),
+            crowdingThreshold: 10
+        )
+        let raw = RawTaxonomyPlan(subfolders: [
+            RawSubfolderProposal(name: "Uber", files: uberFiles, rationale: "uber trips"),
+            RawSubfolderProposal(name: "Amazon", files: amazonFiles, rationale: "amazon orders"),
+        ])
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts", confidence: 0.5),
+            triage: makeFastTriage(),
+            planner: StubOrchPlanner(plan: raw)
+        )
+
+        await orch.runCuratorScan()
+        let plan = try #require(await orch.currentPendingPlans().first)
+
+        let (batchID, moves) = try await orch.approvePlan(plan.id)
+        #expect(moves.count == uberFiles.count + amazonFiles.count)
+        #expect(moves.allSatisfy { $0.batchID == batchID })
+
+        // Files now live under the new subfolders.
+        for f in uberFiles {
+            #expect(fm.fileExists(atPath: receipts.appendingPathComponent("Uber/\(f)").path))
+            #expect(!fm.fileExists(atPath: receipts.appendingPathComponent(f).path))
+        }
+        for f in amazonFiles {
+            #expect(fm.fileExists(atPath: receipts.appendingPathComponent("Amazon/\(f)").path))
+        }
+        // Plan no longer pending.
+        #expect((await orch.currentPendingPlans()).isEmpty)
+        // Newly-created subfolders are now candidate destinations for future moves.
+        #expect(config.candidateFolders().contains("Receipts/Uber"))
+        #expect(config.candidateFolders().contains("Receipts/Amazon"))
+
+        // Batch undo restores everything.
+        let undone = await orch.undoBatch(batchID)
+        #expect(undone.count == moves.count)
+        for f in (uberFiles + amazonFiles) {
+            #expect(fm.fileExists(atPath: receipts.appendingPathComponent(f).path))
+        }
+        // Subfolders left behind even though empty (no deletion ever).
+        #expect(fm.fileExists(atPath: receipts.appendingPathComponent("Uber").path))
+        #expect(fm.fileExists(atPath: receipts.appendingPathComponent("Amazon").path))
+    }
+
+    @Test func approvePlan_partialFailureContinues() async throws {
+        // One of the files in the plan doesn't exist on disk — the rest of the batch
+        // should still apply, and undo should still work for the moves that landed.
+        let source = tmpRoot.appendingPathComponent("DesktopP", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedP", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let receipts = organized.appendingPathComponent("Receipts", isDirectory: true)
+        try fm.createDirectory(at: receipts, withIntermediateDirectories: true)
+        for i in 0..<5 { try Data().write(to: receipts.appendingPathComponent("u\(i).png")) }
+
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerP.jsonl"),
+            crowdingThreshold: 5
+        )
+        let raw = RawTaxonomyPlan(subfolders: [
+            // "ghost.png" never existed. The first cluster reaches validation with valid
+            // existingFiles, so validation keeps real files only — to test partial-apply
+            // we add a ghost AFTER validation by manually constructing a plan via the
+            // pending list. Simplest: validation lets the real ones through; we then
+            // delete one file out-of-band before approving.
+            RawSubfolderProposal(name: "Uber",
+                files: ["u0.png", "u1.png", "u2.png", "u3.png", "u4.png"],
+                rationale: "")
+        ])
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts", confidence: 0.5),
+            triage: makeFastTriage(),
+            planner: StubOrchPlanner(plan: raw)
+        )
+        await orch.runCuratorScan()
+        let plan = try #require(await orch.currentPendingPlans().first)
+
+        // Disappear one file between proposal and approval — Filer.move will throw
+        // sourceMissing for u2.png; the rest of the batch should still apply.
+        try fm.removeItem(at: receipts.appendingPathComponent("u2.png"))
+
+        let (batchID, moves) = try await orch.approvePlan(plan.id)
+        #expect(moves.count == 4)
+        #expect(moves.allSatisfy { $0.batchID == batchID })
+        let batchInLedger = await orch.movesInBatch(batchID)
+        #expect(batchInLedger.count == 4)
+    }
+
     @Test func dismissPlan_removesPendingEntry() async throws {
         let source = tmpRoot.appendingPathComponent("DesktopD", isDirectory: true)
         let organized = tmpRoot.appendingPathComponent("OrganizedD", isDirectory: true)

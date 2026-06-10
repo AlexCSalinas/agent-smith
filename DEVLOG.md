@@ -2,6 +2,36 @@
 
 Running log of decisions and parked ideas. Newest first.
 
+## 2026-06-09 — M8: Apply plans with batch undo
+
+`SmithOrchestrator.approvePlan(_:)` no longer stubs — it materializes the plan
+as real `Filer.move`s under a single shared `batchID`. Partial failures
+(file disappeared, name collision in subfolder) log + skip; the rest of the
+batch still applies. `undoBatch(_:)` reverses every un-undone move in
+reverse order, also skipping individual failures.
+
+### `Move.batchID` is backward-compatible Codable
+
+Adding the field as `UUID?` with a custom `init(from:)`/`encode(to:)` that
+uses `decodeIfPresent`/`encodeIfPresent`. Pre-M8 ledger lines decode with
+`batchID == nil`; new non-batch moves serialize identically to v1 (no
+`"batchID"` key emitted). Decode test pins this behavior with a literal
+old-format JSON line.
+
+### Subfolders survive undo intentionally
+
+Per Prime Directive 1 (never delete a user file), `undoBatch` leaves the
+newly-created subfolders on disk even if they end up empty. The user can
+remove them by hand if they don't want them. After a successful apply
+those subfolders are immediately part of `candidateFolders()` (depth-2
+sweep from M6), so the live classifier starts filing into them.
+
+### Activity feed: batch as one row
+
+`AppState.recentActivity` groups by `batchID` into `ActivityEntry` values
+(single move vs batch summary). The batch row reads "Reorganized
+Receipts into 3 subfolders · 25 files" with a single `[Undo all]` button.
+
 ## 2026-06-09 — M7: Curator proposes taxonomy plans (read-only)
 
 New `Sources/Curator/` module. The Curator watches for crowded top-level categories

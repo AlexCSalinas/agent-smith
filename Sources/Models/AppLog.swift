@@ -12,5 +12,6 @@ public enum AppLog {
     public static let filer      = Logger(subsystem: subsystem, category: "Filer")
     public static let ledger     = Logger(subsystem: subsystem, category: "Ledger")
     public static let smith      = Logger(subsystem: subsystem, category: "Smith")
+    public static let curator    = Logger(subsystem: subsystem, category: "Curator")
     public static let app        = Logger(subsystem: subsystem, category: "App")
 }

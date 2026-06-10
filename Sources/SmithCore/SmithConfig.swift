@@ -21,19 +21,25 @@ public struct SmithConfig: Sendable {
     ///
     /// Setting this to "Other" disables the review queue entirely — Smith always moves.
     public var fallbackFolder: String?
+    /// Curator threshold: a top-level category is considered "crowded" once it has at
+    /// least this many loose files at depth 1. M7 surfaces a plan for crowded
+    /// categories; nothing files-without-approval based on this.
+    public var crowdingThreshold: Int
 
     public init(
         sourceFolder: URL,
         organizedRoot: URL,
         ledgerURL: URL,
         autoFileThreshold: Double = 0.85,
-        fallbackFolder: String? = nil
+        fallbackFolder: String? = nil,
+        crowdingThreshold: Int = 20
     ) {
         self.sourceFolder = sourceFolder
         self.organizedRoot = organizedRoot
         self.ledgerURL = ledgerURL
         self.autoFileThreshold = autoFileThreshold
         self.fallbackFolder = fallbackFolder
+        self.crowdingThreshold = crowdingThreshold
     }
 
     /// Default development config, anchored to the project's Sandbox tree at CWD.

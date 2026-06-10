@@ -5,6 +5,7 @@ import Triage
 import Filer
 import Ledger
 import Classifier
+import Curator
 
 /// Wires the modules together: Watcher → Triage → Classifier → (Filer + Ledger) or review queue.
 /// One `Smith` is spawned per file via `assimilate(_:)` (the per-file work unit from
@@ -17,6 +18,9 @@ public actor SmithOrchestrator {
             case skipped(URL, reason: String)
             case error(URL, message: String)
             case undone(Move)
+            /// Curator surfaced a validated plan for a crowded category. Sits in
+            /// `currentPendingPlans()` until the user approves or dismisses it.
+            case curatorProposed(CuratorPlan)
         }
         public let timestamp: Date
         public let kind: Kind
@@ -33,16 +37,19 @@ public actor SmithOrchestrator {
     private let classifier: any FolderClassifier
     private let filer: Filer
     private let ledger: Ledger
+    private let curator: Curator
 
     private var watchTask: Task<Void, Never>?
     private var reviewQueue: [ReviewItem] = []
+    private var pendingPlans: [CuratorPlan] = []
     private let eventsContinuation: AsyncStream<Event>.Continuation
     public nonisolated let events: AsyncStream<Event>
 
     public init(
         config: SmithConfig,
         classifier: any FolderClassifier = LocalClassifier(),
-        triage: Triage = Triage()
+        triage: Triage = Triage(),
+        planner: TaxonomyPlanner? = FoundationModelsTaxonomyPlanner.makeIfAvailable()
     ) throws {
         self.config = config
         self.watcher = FolderWatcher(path: config.sourceFolder)
@@ -50,6 +57,14 @@ public actor SmithOrchestrator {
         self.classifier = classifier
         self.filer = Filer()
         self.ledger = try Ledger(at: config.ledgerURL)
+        self.curator = Curator(
+            config: Curator.Config(
+                organizedRoot: config.organizedRoot,
+                sourceFolder: config.sourceFolder,
+                crowdingThreshold: config.crowdingThreshold
+            ),
+            planner: planner
+        )
 
         let (stream, continuation) = AsyncStream<Event>.makeStream(bufferingPolicy: .bufferingNewest(200))
         self.events = stream
@@ -191,6 +206,41 @@ public actor SmithOrchestrator {
 
     public func dismissReview(_ id: UUID) {
         reviewQueue.removeAll { $0.id == id }
+    }
+
+    // MARK: - Curator
+
+    public func currentPendingPlans() -> [CuratorPlan] { pendingPlans }
+
+    /// Scan for crowded categories and propose a plan for each, surfacing each validated
+    /// plan as a `.curatorProposed` event. Read-only: no files are moved here. Plans for
+    /// categories that already have a pending plan are skipped so repeated scans don't
+    /// pile up duplicates.
+    public func runCuratorScan() async {
+        let crowded = await curator.scanForCrowdedCategories()
+        let alreadyPending = Set(pendingPlans.map(\.category))
+        for category in crowded where !alreadyPending.contains(category) {
+            if let plan = await curator.proposePlan(for: category) {
+                pendingPlans.append(plan)
+                emit(.curatorProposed(plan))
+            }
+        }
+    }
+
+    public func dismissPlan(_ id: UUID) {
+        pendingPlans.removeAll { $0.id == id }
+    }
+
+    /// M7 stub: removes the plan from the pending list and returns it. M8 will wire
+    /// this to actually execute the contained moves under a single ledger batchID.
+    @discardableResult
+    public func approvePlan(_ id: UUID) async throws -> CuratorPlan {
+        guard let idx = pendingPlans.firstIndex(where: { $0.id == id }) else {
+            throw SmithError.undoFailed(reason: "pending plan \(id) not found")
+        }
+        let plan = pendingPlans.remove(at: idx)
+        AppLog.curator.info("approvePlan stub: \(plan.category, privacy: .public) — apply wired in M8")
+        return plan
     }
 
     // MARK: - Undo

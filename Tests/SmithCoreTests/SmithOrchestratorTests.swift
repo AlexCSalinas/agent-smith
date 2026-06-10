@@ -3,6 +3,7 @@ import Testing
 @testable import SmithCore
 @testable import Models
 @testable import Triage
+@testable import Curator
 
 /// Deterministic mock classifier so orchestrator tests don't depend on Vision OCR
 /// or the heuristic's token scoring.
@@ -11,6 +12,15 @@ struct MockClassifier: FolderClassifier {
     let confidence: Double
     func classify(_ signals: FileSignals) async throws -> FolderDecision {
         FolderDecision(folder: folder, confidence: confidence, reason: "mock")
+    }
+}
+
+/// Deterministic stand-in for the on-device taxonomy planner. Used by the orchestrator
+/// curator-scan tests to make plan generation deterministic.
+struct StubOrchPlanner: TaxonomyPlanner {
+    let plan: RawTaxonomyPlan
+    func proposeTaxonomy(category: String, filenames: [String]) async throws -> RawTaxonomyPlan {
+        plan
     }
 }
 
@@ -288,6 +298,94 @@ struct MockClassifier: FolderClassifier {
         let folders = config.candidateFolders()
         // Source IS organizedRoot, so we never see it as an entry. Its children appear normally.
         #expect(folders == ["Memes", "Receipts", "Receipts/Uber"])
+    }
+
+    @Test func runCuratorScan_emitsPlanForCrowdedCategoryAndStoresPending() async throws {
+        let source = tmpRoot.appendingPathComponent("DesktopK", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedK", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let receipts = organized.appendingPathComponent("Receipts", isDirectory: true)
+        try fm.createDirectory(at: receipts, withIntermediateDirectories: true)
+        for i in 0..<20 { try Data().write(to: receipts.appendingPathComponent("u\(i).png")) }
+
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerK.jsonl"),
+            autoFileThreshold: 0.5,
+            crowdingThreshold: 20
+        )
+
+        let raw = RawTaxonomyPlan(subfolders: [
+            RawSubfolderProposal(
+                name: "Uber",
+                files: (0..<10).map { "u\($0).png" },
+                rationale: "uber rides"
+            ),
+        ])
+
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts", confidence: 0.99),
+            triage: makeFastTriage(),
+            planner: StubOrchPlanner(plan: raw)
+        )
+
+        // Collect events emitted during the scan.
+        let stream = orch.events
+        let collected = Task<[SmithOrchestrator.Event], Never> {
+            var out: [SmithOrchestrator.Event] = []
+            for await event in stream {
+                out.append(event)
+                if case .curatorProposed = event.kind { break }
+            }
+            return out
+        }
+
+        await orch.runCuratorScan()
+        let pending = await orch.currentPendingPlans()
+        #expect(pending.count == 1)
+        #expect(pending.first?.category == "Receipts")
+
+        let events = await collected.value
+        #expect(events.contains {
+            if case .curatorProposed(let p) = $0.kind, p.category == "Receipts" { return true }
+            return false
+        })
+
+        // Second scan is a no-op for the same category — no duplicate pending entry.
+        await orch.runCuratorScan()
+        #expect((await orch.currentPendingPlans()).count == 1)
+    }
+
+    @Test func dismissPlan_removesPendingEntry() async throws {
+        let source = tmpRoot.appendingPathComponent("DesktopD", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedD", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let receipts = organized.appendingPathComponent("Receipts", isDirectory: true)
+        try fm.createDirectory(at: receipts, withIntermediateDirectories: true)
+        for i in 0..<20 { try Data().write(to: receipts.appendingPathComponent("u\(i).png")) }
+
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerD.jsonl"),
+            crowdingThreshold: 20
+        )
+        let raw = RawTaxonomyPlan(subfolders: [
+            RawSubfolderProposal(name: "Uber", files: (0..<5).map { "u\($0).png" }, rationale: ""),
+        ])
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts", confidence: 0.5),
+            triage: makeFastTriage(),
+            planner: StubOrchPlanner(plan: raw)
+        )
+
+        await orch.runCuratorScan()
+        let plan = try #require(await orch.currentPendingPlans().first)
+        await orch.dismissPlan(plan.id)
+        #expect((await orch.currentPendingPlans()).isEmpty)
     }
 
     @Test func assimilate_skipsWhenNoCandidateFolders() async throws {

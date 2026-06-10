@@ -2,6 +2,51 @@
 
 Running log of decisions and parked ideas. Newest first.
 
+## 2026-06-09 — M7: Curator proposes taxonomy plans (read-only)
+
+New `Sources/Curator/` module. The Curator watches for crowded top-level categories
+(≥ `SmithConfig.crowdingThreshold` loose files at depth 1, default 20), asks the
+on-device LLM via `TaxonomyPlanner` to cluster the filenames into 3–7 short
+subfolder names, then runs every deterministic validation rule before surfacing the
+plan to the orchestrator. **No files move in M7** — plans sit in
+`SmithOrchestrator.currentPendingPlans()` and a new `.curatorProposed(CuratorPlan)`
+event surfaces them. M8 wires Approve to actually apply.
+
+### Prime Directive 2 carve-out (recorded)
+
+CLAUDE.md §3 ("do NOT auto-create brand-new folders / invent a taxonomy") relaxes
+*only* via Curator approval: a user must explicitly approve a `CuratorPlan` before
+any new subfolder gets created or any file gets moved. The live classifier path
+remains forbidden from inventing folders. This was an intentional, scoped
+relaxation — not a Prime Directive override.
+
+### Validator rules (every one is tested)
+
+- Names: trim, reject path separators (`/`, `\`), reject leading dots, reject empty.
+- Fuzzy-match proposed name vs existing subfolders (case- and
+  punctuation-insensitive — "uber-rides" collapses onto an existing "UberRides")
+  so repeated runs converge instead of fragmenting.
+- Drop duplicate cluster names within a plan after the same normalization.
+- Filter files to those that actually exist as loose files in the category.
+- First cluster wins for files claimed by multiple clusters.
+- Drop clusters with fewer than 3 surviving files. Return `nil` if nothing survives.
+
+### Planner backend
+
+`FoundationModelsTaxonomyPlanner` is the on-device LLM path (gated behind
+`#if canImport(FoundationModels)`). The placeholder branch returns `nil` from
+`makeIfAvailable()` so the Curator is simply inactive on macOS < 26 — no
+heuristic fallback. Per-prompt filenames are capped at 120 entries; very crowded
+categories surface a fresh plan on a later scan after the first is approved.
+
+### Orchestrator surface
+
+- `runCuratorScan()` — fire-and-forget read-only scan; emits `.curatorProposed`
+  events for each new plan. Idempotent: categories with a pending plan are skipped.
+- `currentPendingPlans()` / `dismissPlan(_:)` / `approvePlan(_:)` (M7 stub).
+- Menubar adds a "Curator plans" section with Approve/Dismiss buttons + a
+  "Scan now" button when empty.
+
 ## 2026-06-09 — M6: Deep filing into existing subfolders
 
 `SmithConfig.candidateFolders()` now returns relative paths up to depth 2

@@ -39,8 +39,13 @@ let package = Package(
             path: "Sources/Classifier"
         ),
         .target(
+            name: "Curator",
+            dependencies: ["Models"],
+            path: "Sources/Curator"
+        ),
+        .target(
             name: "SmithCore",
-            dependencies: ["Models", "Watcher", "Triage", "Filer", "Ledger", "Classifier"],
+            dependencies: ["Models", "Watcher", "Triage", "Filer", "Ledger", "Classifier", "Curator"],
             path: "Sources/SmithCore"
         ),
 
@@ -81,8 +86,13 @@ let package = Package(
             path: "Tests/ClassifierTests"
         ),
         .testTarget(
+            name: "CuratorTests",
+            dependencies: ["Curator", "Models"],
+            path: "Tests/CuratorTests"
+        ),
+        .testTarget(
             name: "SmithCoreTests",
-            dependencies: ["SmithCore", "Triage", "Models"],
+            dependencies: ["SmithCore", "Curator", "Triage", "Models"],
             path: "Tests/SmithCoreTests"
         )
     ]

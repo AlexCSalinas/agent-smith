@@ -158,8 +158,9 @@ public actor SmithOrchestrator {
             return
         }
 
-        // Auto-file.
-        let destDir = config.organizedRoot.appendingPathComponent(effectiveDecision.folder, isDirectory: true)
+        // Auto-file. Destination may be nested (e.g. "Receipts/Uber") — appendRelative
+        // splits on "/" so each component lands as a real path component on every macOS.
+        let destDir = config.organizedRoot.appendRelative(effectiveDecision.folder)
         do {
             let move = try filer.move(url, intoDirectory: destDir, decision: effectiveDecision)
             try await ledger.append(move)
@@ -173,14 +174,15 @@ public actor SmithOrchestrator {
 
     public func currentReviewQueue() -> [ReviewItem] { reviewQueue }
 
-    /// User-approved review item: move it using the (possibly user-corrected) folder name.
+    /// User-approved review item: move it using the (possibly user-corrected) folder path.
+    /// `folder` may be a nested relative path like "Receipts/Uber".
     public func approveReview(_ id: UUID, intoFolder folder: String) async throws -> Move {
         guard let idx = reviewQueue.firstIndex(where: { $0.id == id }) else {
             throw SmithError.undoFailed(reason: "review item \(id) not found")
         }
         let item = reviewQueue.remove(at: idx)
         let decision = FolderDecision(folder: folder, confidence: 1.0, reason: "user-approved")
-        let destDir = config.organizedRoot.appendingPathComponent(folder, isDirectory: true)
+        let destDir = config.organizedRoot.appendRelative(folder)
         let move = try filer.move(item.url, intoDirectory: destDir, decision: decision)
         try await ledger.append(move)
         emit(.filed(move))
@@ -220,5 +222,20 @@ public actor SmithOrchestrator {
 
     private func emit(_ kind: Event.Kind) {
         eventsContinuation.yield(Event(kind: kind))
+    }
+}
+
+extension URL {
+    /// Append a relative path that may contain "/" separators (e.g. "Receipts/Uber"),
+    /// splitting it into real path components. Empty / leading-slash segments are dropped.
+    /// `URL.appendingPathComponent` happens to preserve slashes for file URLs on macOS,
+    /// but going through the components API keeps that out of the platform-specific path
+    /// and makes intent explicit.
+    func appendRelative(_ relative: String) -> URL {
+        var url = self
+        for component in relative.split(separator: "/", omittingEmptySubsequences: true) {
+            url.appendPathComponent(String(component), isDirectory: true)
+        }
+        return url
     }
 }

@@ -57,6 +57,49 @@ import Testing
         #expect(decision.folder == "Meetings")
     }
 
+    @Test func heuristic_prefersNestedMatchOverParent() {
+        let signals = FileSignals(
+            url: URL(fileURLWithPath: "/x/uber-receipt.png"),
+            filename: "uber-receipt-2026.png",
+            byteSize: 100,
+            ocrText: "Uber trip total $24.50",
+            imageLabels: [],
+            candidateFolders: ["Receipts", "Receipts/Uber", "Receipts/Amazon"]
+        )
+        let decision = HeuristicBackend().classify(signals)
+        #expect(decision.folder == "Receipts/Uber")
+    }
+
+    @Test func heuristic_fallsBackToParentWhenNoSubMatch() {
+        let signals = FileSignals(
+            url: URL(fileURLWithPath: "/x/anon-receipt.png"),
+            filename: "purchase-receipt.png",
+            byteSize: 100,
+            ocrText: "Receipt for purchase",
+            imageLabels: [],
+            candidateFolders: ["Receipts", "Receipts/Uber", "Receipts/Amazon"]
+        )
+        let decision = HeuristicBackend().classify(signals)
+        #expect(decision.folder == "Receipts")
+    }
+
+    @Test func foundationModels_truncate_keepsTopLevelAndRoundRobinsSubs() {
+        let candidates = [
+            "A", "A/a1", "A/a2", "A/a3",
+            "B", "B/b1", "B/b2",
+            "C", "C/c1",
+            "D"
+        ]
+        let truncated = FoundationModelsBackend.truncate(candidates, to: 7)
+        // All top-level kept, then round-robin: a1, b1, c1, a2 (B and C exhausted).
+        #expect(truncated == ["A", "B", "C", "D", "A/a1", "B/b1", "C/c1"])
+    }
+
+    @Test func foundationModels_truncate_isIdentityUnderBudget() {
+        let candidates = ["A", "A/x", "B"]
+        #expect(FoundationModelsBackend.truncate(candidates, to: 40) == candidates)
+    }
+
     @Test func heuristic_isDeterministic() {
         let signals = FileSignals(
             url: URL(fileURLWithPath: "/x/work-doc.png"),

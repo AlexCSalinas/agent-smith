@@ -72,23 +72,42 @@ public struct SmithConfig: Sendable {
         )
     }
 
-    /// List of candidate folder names — the direct subdirectories of `organizedRoot`,
-    /// excluding the source folder itself (so the watched inbox isn't a valid file destination).
-    /// Smith never invents folders; the user creates them under the organized root manually.
+    /// List of candidate folder paths — relative paths under `organizedRoot`, up to depth 2
+    /// (e.g. `"Receipts"`, `"Receipts/Uber"`). Excludes the source folder, hidden directories,
+    /// and anything that isn't a directory. Smith never invents folders; the user (or a
+    /// user-approved Curator plan) creates them under the organized root.
     public func candidateFolders() -> [String] {
         let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(
+        guard let topLevel = try? fm.contentsOfDirectory(
             at: organizedRoot,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
         let sourcePath = sourceFolder.standardizedFileURL.path
+        var results: [String] = []
 
-        return contents
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-            .filter { $0.standardizedFileURL.path != sourcePath }
-            .map { $0.lastPathComponent }
-            .sorted()
+        for top in topLevel {
+            guard (try? top.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            // Exclude the source folder itself — the watched inbox is never a destination.
+            if top.standardizedFileURL.path == sourcePath { continue }
+
+            let topName = top.lastPathComponent
+            results.append(topName)
+
+            // Depth 2: enumerate subdirectories of this top-level category.
+            if let subs = try? fm.contentsOfDirectory(
+                at: top,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for sub in subs {
+                    guard (try? sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+                    results.append("\(topName)/\(sub.lastPathComponent)")
+                }
+            }
+        }
+
+        return results.sorted()
     }
 }

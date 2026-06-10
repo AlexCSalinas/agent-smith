@@ -34,6 +34,8 @@ public struct FoundationModelsBackend: Sendable {
     }
 
     public func classify(_ signals: FileSignals) async throws -> FolderDecision {
+        let prompted = FoundationModelsBackend.truncate(signals.candidateFolders, to: FoundationModelsBackend.candidateBudget)
+
         let session = LanguageModelSession(instructions: instructions)
         let prompt = """
             Filename: \(signals.filename)
@@ -41,8 +43,8 @@ public struct FoundationModelsBackend: Sendable {
             Text in image:
             \(signals.ocrText.isEmpty ? "(no text)" : signals.ocrText)
 
-            Existing folders (choose exactly one):
-            \(signals.candidateFolders.map { "- \($0)" }.joined(separator: "\n"))
+            Existing folders (choose exactly one, paths are relative — pick the most specific match):
+            \(prompted.map { "- \($0)" }.joined(separator: "\n"))
             """
 
         let response = try await session.respond(
@@ -50,17 +52,18 @@ public struct FoundationModelsBackend: Sendable {
             generating: _GenerableDecision.self
         ).content
 
-        // Defend against the model picking a folder not in the candidate list.
-        let folder = signals.candidateFolders.contains(response.folder)
+        // Off-list guard: the LLM only saw `prompted`, so accept only picks from that set.
+        // If it invents or hallucinates a folder, force confidence to zero — the fallback /
+        // review path then takes over upstream.
+        let folder = prompted.contains(response.folder)
             ? response.folder
-            : (signals.candidateFolders.first ?? "")
+            : (prompted.first ?? "")
 
-        let confidence = signals.candidateFolders.contains(response.folder)
-            ? response.confidence
-            : 0.0  // model made one up — route to review
+        let confidence = prompted.contains(response.folder) ? response.confidence : 0.0
 
         return FolderDecision(folder: folder, confidence: confidence, reason: response.reason)
     }
+
 }
 
 @Generable
@@ -92,3 +95,55 @@ public struct FoundationModelsBackend: Sendable {
     }
 }
 #endif
+
+extension FoundationModelsBackend {
+    /// Soft ceiling on candidate entries sent to the on-device LLM. The Foundation Models
+    /// context window is small; ~40 entries leaves room for filename, OCR text, and labels
+    /// without blowing the budget. See DEVLOG ("Context budget for nested candidates").
+    static var candidateBudget: Int { 40 }
+
+    /// Pick a representative subset of `candidates` within the context budget. Top-level
+    /// categories (no `/`) are always retained; subfolders are added round-robin per category
+    /// until the cap is reached. Preserves the input order's relative ranking within each
+    /// category so callers can prioritize via the sort coming out of `candidateFolders()`.
+    ///
+    /// Lives outside the `#if canImport(FoundationModels)` gate so it remains testable on
+    /// SDKs that ship the placeholder backend.
+    static func truncate(_ candidates: [String], to budget: Int) -> [String] {
+        guard candidates.count > budget else { return candidates }
+
+        var topLevel: [String] = []
+        var subsByParent: [String: [String]] = [:]
+        var parentOrder: [String] = []
+
+        for c in candidates {
+            if let slash = c.firstIndex(of: "/") {
+                let parent = String(c[..<slash])
+                if subsByParent[parent] == nil {
+                    subsByParent[parent] = []
+                    parentOrder.append(parent)
+                }
+                subsByParent[parent]?.append(c)
+            } else {
+                topLevel.append(c)
+            }
+        }
+
+        var picked: [String] = topLevel
+        // Round-robin across parents so no single crowded category eats the whole budget.
+        var indices: [String: Int] = [:]
+        while picked.count < budget {
+            var addedThisPass = false
+            for parent in parentOrder where picked.count < budget {
+                let idx = indices[parent, default: 0]
+                if let subs = subsByParent[parent], idx < subs.count {
+                    picked.append(subs[idx])
+                    indices[parent] = idx + 1
+                    addedThisPass = true
+                }
+            }
+            if !addedThisPass { break }
+        }
+        return picked
+    }
+}

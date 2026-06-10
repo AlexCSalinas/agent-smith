@@ -2,6 +2,40 @@
 
 Running log of decisions and parked ideas. Newest first.
 
+## 2026-06-09 — M6: Deep filing into existing subfolders
+
+`SmithConfig.candidateFolders()` now returns relative paths up to depth 2
+(`"Receipts"`, `"Receipts/Uber"`). Live classification can now pick a subfolder
+that already exists — folder *creation* remains forbidden for the live path
+(reserved for the upcoming Curator in M7/M8). Off-list guards stay in both
+backends; a hallucinated folder returns confidence 0.0.
+
+### Context budget — chose truncation
+
+The on-device Foundation Models window is small. We cap candidate entries sent
+to the LLM at 40 (see `FoundationModelsBackend.candidateBudget`). All top-level
+categories are always retained; subfolders are added round-robin per category
+until the cap is reached. Chosen over two-stage prompting because the upstream
+list is already sorted and the v1 deployment has < 20 categories — truncation
+is one round-trip and good enough; two-stage was overkill for the projected
+catalog size.
+
+### Heuristic nested scoring
+
+`HeuristicBackend` now scores `"Receipts/Uber"` primarily on the last
+component (`Uber`) with a 30% contribution from parent tokens, plus a small
+nesting bonus so a confidently-matched subfolder beats its equally-confident
+parent. The bonus pushes raw score > 1.0; the final confidence is still
+clamped (`min(0.9, score)`).
+
+### Orchestrator path handling
+
+`URL.appendingPathComponent("a/b")` happens to preserve slashes for file URLs,
+but to keep that out of the platform-specific path we added
+`URL.appendRelative(_:)` which explicitly splits on `/`. Used in
+`assimilate(_:)` and `approveReview(_:intoFolder:)`. `Filer.move` already
+handled intermediate directory creation, so no changes there.
+
 ## 2026-06-09 — Always-on via LaunchAgent
 
 User wanted Agent Smith to run with zero ongoing effort. Added two helper scripts:

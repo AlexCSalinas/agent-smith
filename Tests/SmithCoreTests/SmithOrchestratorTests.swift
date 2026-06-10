@@ -216,6 +216,80 @@ struct MockClassifier: FolderClassifier {
         #expect(fm.fileExists(atPath: moved.appendingPathComponent("inner.txt").path))
     }
 
+    @Test func assimilate_filesIntoNestedSubfolder() async throws {
+        let source = tmpRoot.appendingPathComponent("DesktopN", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedN", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts/Uber"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts/Amazon"), withIntermediateDirectories: true)
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerN.jsonl"),
+            autoFileThreshold: 0.5
+        )
+        let orch = try SmithOrchestrator(
+            config: config,
+            classifier: MockClassifier(folder: "Receipts/Uber", confidence: 0.9),
+            triage: makeFastTriage()
+        )
+
+        let file = source.appendingPathComponent("trip.png")
+        try Data("p".utf8).write(to: file)
+        await orch.assimilate(file)
+
+        let dest = organized.appendingPathComponent("Receipts/Uber/trip.png")
+        #expect(fm.fileExists(atPath: dest.path))
+        #expect(!fm.fileExists(atPath: file.path))
+
+        // Round-trip undo against the nested destination.
+        let move = try #require(await orch.recentMoves().first)
+        _ = try await orch.undo(move.id)
+        #expect(fm.fileExists(atPath: file.path))
+        #expect(!fm.fileExists(atPath: dest.path))
+    }
+
+    @Test func candidateFolders_returnsDepth2RelativePaths() throws {
+        let source = tmpRoot.appendingPathComponent("DesktopC", isDirectory: true)
+        let organized = tmpRoot.appendingPathComponent("OrganizedC", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts/Uber"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts/Amazon"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: organized.appendingPathComponent("Memes"), withIntermediateDirectories: true)
+        // Depth-3 entry — must NOT appear.
+        try fm.createDirectory(at: organized.appendingPathComponent("Receipts/Uber/2024"), withIntermediateDirectories: true)
+        // Hidden directory at depth 1 — must NOT appear.
+        try fm.createDirectory(at: organized.appendingPathComponent(".hidden"), withIntermediateDirectories: true)
+        let config = SmithConfig(
+            sourceFolder: source,
+            organizedRoot: organized,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerC.jsonl")
+        )
+
+        let folders = config.candidateFolders()
+        #expect(folders == [
+            "Memes",
+            "Receipts",
+            "Receipts/Amazon",
+            "Receipts/Uber"
+        ])
+    }
+
+    @Test func candidateFolders_excludesSourceFolderWhenInsideOrganizedRoot() throws {
+        // The Desktop layout: source == organizedRoot, with category folders sitting beside files.
+        let shared = tmpRoot.appendingPathComponent("Desktop", isDirectory: true)
+        try fm.createDirectory(at: shared.appendingPathComponent("Receipts/Uber"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: shared.appendingPathComponent("Memes"), withIntermediateDirectories: true)
+        let config = SmithConfig(
+            sourceFolder: shared,
+            organizedRoot: shared,
+            ledgerURL: tmpRoot.appendingPathComponent("ledgerS.jsonl")
+        )
+        let folders = config.candidateFolders()
+        // Source IS organizedRoot, so we never see it as an entry. Its children appear normally.
+        #expect(folders == ["Memes", "Receipts", "Receipts/Uber"])
+    }
+
     @Test func assimilate_skipsWhenNoCandidateFolders() async throws {
         let source = tmpRoot.appendingPathComponent("Desktop2", isDirectory: true)
         let organized = tmpRoot.appendingPathComponent("Empty", isDirectory: true)

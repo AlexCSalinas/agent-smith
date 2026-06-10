@@ -22,23 +22,52 @@ public struct HeuristicBackend: Sendable {
 
         var best: (folder: String, score: Double, hits: Set<String>) = (signals.candidateFolders[0], 0.0, [])
         for folder in signals.candidateFolders {
-            let folderTokens = Self.tokenize(folder)
+            // Nested paths like "Receipts/Uber" score primarily on the LAST component
+            // ("Uber"), so a screenshot whose signal tokens include "uber" picks
+            // Receipts/Uber over plain Receipts even though "Receipts" matches too.
+            // For top-level folders the last component IS the whole path; parent tokens
+            // are intentionally empty in that case so we don't double-count them.
+            let segments = folder.split(separator: "/").map(String.init)
+            let last = segments.last ?? folder
+            let parentSegments = segments.dropLast()
+            let lastTokens = Self.tokenize(last)
+            let parentTokens = parentSegments.isEmpty
+                ? Set<String>()
+                : Self.tokenize(parentSegments.joined(separator: " "))
+            let folderTokens = lastTokens.union(parentTokens)
             guard !folderTokens.isEmpty else { continue }
 
             // Match folder tokens against signal tokens with light substring fuzz so
             // simple plurals ("receipt" ↔ "receipts") and shared roots still hit.
-            let hits: Set<String> = Set(folderTokens.filter { ft in
+            func matches(_ ft: String) -> Bool {
                 signalTokens.contains { st in
                     st == ft
                         || (ft.count >= 4 && st.contains(ft))
                         || (st.count >= 4 && ft.contains(st))
                 }
-            })
-            // Score: how many folder tokens are matched, weighted by folder specificity.
-            let coverage = Double(hits.count) / Double(folderTokens.count)
-            // Penalty for very short folder names (single letter) to avoid spurious matches.
+            }
+            let lastHits = Set(lastTokens.filter(matches))
+            let parentHits = Set(parentTokens.filter(matches))
+
+            let lastCoverage = lastTokens.isEmpty ? 0 : Double(lastHits.count) / Double(lastTokens.count)
+            let parentCoverage = parentTokens.isEmpty ? 0 : Double(parentHits.count) / Double(parentTokens.count)
+            // Subfolder match dominates. For top-level folders parentCoverage is 0 by
+            // construction, so the weight just becomes the lastCoverage.
+            let coverage = parentTokens.isEmpty
+                ? lastCoverage
+                : (lastCoverage * 0.7 + parentCoverage * 0.3)
+            // Penalty for very short overall folder paths (single-letter names) to avoid
+            // spurious matches. Use the full path length so short subfolder names like
+            // "Uber" still score well when nested under "Receipts".
             let lengthFactor = min(1.0, Double(folder.count) / 6.0)
-            let score = coverage * lengthFactor
+            // Small nesting bonus so a confidently-matched subfolder beats its parent
+            // when both match perfectly. The bonus is applied *after* lengthFactor so it
+            // can push past 1.0 — the final confidence is still clamped by the caller
+            // (min(0.9, …)). Without this, "Receipts/Uber" (1.0) and "Receipts" (1.0)
+            // would tie and the strict `>` below would keep whichever came first.
+            let nestingBonus = parentTokens.isEmpty ? 1.0 : 1.05
+            let score = coverage * lengthFactor * nestingBonus
+            let hits = lastHits.union(parentHits)
 
             if score > best.score {
                 best = (folder, score, hits)
